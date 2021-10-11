@@ -12,21 +12,30 @@ import (
 	"github.com/tidwall/gjson"
 )
 
+// Parser adheres to the parser interface, contains the parser configuration, and data required to parse JSON
 type Parser struct {
-	InputJSON   []byte
+	// These struct fields are common for a parser
 	Configs     []Config
 	DefaultTags map[string]string
 	Log         telegraf.Logger
-	Timestamp   time.Time
 
+	// **** The struct fields bellow this comment are used for processing indvidual configs ****
+
+	// measurementName is the the name of the current config used in each line protocol
 	measurementName string
+	// timestamp is the timestamp used in each line protocol, defaults to time.Now()
+	timestamp time.Time
 
+	// **** Specific for object configuration ****
+	// subPathResults contains the results of sub-gjson path expressions provided in fields/tags table within object config
+	subPathResults []PathResult
+	// iterateObjects dictates if ExpandArray function will handle objects
 	iterateObjects bool
-
-	currentSettings JSONObject
-	pathResults     []PathResult
+	// objectConfig contains the config for an object, some info is needed while iterating over the gjson results
+	objectConfig JSONObject
 }
 
+// PathResult defines a
 type PathResult struct {
 	result gjson.Result
 	tag    bool
@@ -82,11 +91,18 @@ type MetricNode struct {
 	gjson.Result
 }
 
+func (p *Parser) ParseLine(line string) (telegraf.Metric, error) {
+	return nil, fmt.Errorf("parseLine is designed for parsing influx line protocol, therefore not implemented for parsing JSON")
+}
+
+func (p *Parser) SetDefaultTags(tags map[string]string) {
+	p.DefaultTags = tags
+}
+
 func (p *Parser) Parse(input []byte) ([]telegraf.Metric, error) {
-	p.InputJSON = input
 	// Only valid JSON is supported
-	if !gjson.Valid(string(p.InputJSON)) {
-		return nil, fmt.Errorf("Invalid JSON provided, unable to parse")
+	if !gjson.Valid(string(input)) {
+		return nil, fmt.Errorf("invalid JSON provided, unable to parse")
 	}
 
 	var metrics []telegraf.Metric
@@ -95,16 +111,16 @@ func (p *Parser) Parse(input []byte) ([]telegraf.Metric, error) {
 		// Measurement name configuration
 		p.measurementName = c.MeasurementName
 		if c.MeasurementNamePath != "" {
-			result := gjson.GetBytes(p.InputJSON, c.MeasurementNamePath)
+			result := gjson.GetBytes(input, c.MeasurementNamePath)
 			if !result.IsArray() && !result.IsObject() {
 				p.measurementName = result.String()
 			}
 		}
 
 		// Timestamp configuration
-		p.Timestamp = time.Now()
+		p.timestamp = time.Now()
 		if c.TimestampPath != "" {
-			result := gjson.GetBytes(p.InputJSON, c.TimestampPath)
+			result := gjson.GetBytes(input, c.TimestampPath)
 			if !result.IsArray() && !result.IsObject() {
 				if c.TimestampFormat == "" {
 					err := fmt.Errorf("use of 'timestamp_query' requires 'timestamp_format'")
@@ -112,24 +128,22 @@ func (p *Parser) Parse(input []byte) ([]telegraf.Metric, error) {
 				}
 
 				var err error
-				p.Timestamp, err = internal.ParseTimestamp(c.TimestampFormat, result.Value(), c.TimestampTimezone)
+				p.timestamp, err = internal.ParseTimestamp(c.TimestampFormat, result.Value(), c.TimestampTimezone)
 				if err != nil {
 					return nil, err
 				}
 			}
 		}
 
-		fields, err := p.processMetric(c.Fields, false)
+		fields, err := p.processMetric(input, c.Fields, false)
 		if err != nil {
 			return nil, err
 		}
-
-		tags, err := p.processMetric(c.Tags, true)
+		tags, err := p.processMetric(input, c.Tags, true)
 		if err != nil {
 			return nil, err
 		}
-
-		objects, err := p.processObjects(c.JSONObjects)
+		objects, err := p.processObjects(input, c.JSONObjects)
 		if err != nil {
 			return nil, err
 		}
@@ -155,19 +169,18 @@ func (p *Parser) Parse(input []byte) ([]telegraf.Metric, error) {
 // processMetric will iterate over all 'field' or 'tag' configs and create metrics for each
 // A field/tag can either be a single value or an array of values, each resulting in its own metric
 // For multiple configs, a set of metrics is created from the cartesian product of each separate config
-func (p *Parser) processMetric(data []DataSet, tag bool) ([]telegraf.Metric, error) {
+func (p *Parser) processMetric(input []byte, data []DataSet, tag bool) ([]telegraf.Metric, error) {
 	if len(data) == 0 {
 		return nil, nil
 	}
 
-	p.iterateObjects = false
 	var metrics [][]telegraf.Metric
 
 	for _, c := range data {
 		if c.Path == "" {
 			return nil, fmt.Errorf("GJSON path is required")
 		}
-		result := gjson.GetBytes(p.InputJSON, c.Path)
+		result := gjson.GetBytes(input, c.Path)
 
 		if result.IsObject() {
 			p.Log.Debugf("Found object in the path: %s, ignoring it please use 'object' to gather metrics from objects", c.Path)
@@ -191,7 +204,7 @@ func (p *Parser) processMetric(data []DataSet, tag bool) ([]telegraf.Metric, err
 				p.measurementName,
 				map[string]string{},
 				map[string]interface{}{},
-				p.Timestamp,
+				p.timestamp,
 			),
 			Result: result,
 		}
@@ -251,9 +264,6 @@ func (p *Parser) expandArray(result MetricNode) ([]telegraf.Metric, error) {
 			p.Log.Debugf("Found object in query ignoring it please use 'object' to gather metrics from objects")
 			return results, nil
 		}
-		if result.IncludeCollection == nil && (len(p.currentSettings.FieldPaths) > 0 || len(p.currentSettings.TagPaths) > 0) {
-			result.IncludeCollection = p.existsInpathResults(result.Index, result.Raw)
-		}
 		r, err := p.combineObject(result)
 		if err != nil {
 			return nil, err
@@ -264,34 +274,22 @@ func (p *Parser) expandArray(result MetricNode) ([]telegraf.Metric, error) {
 
 	if result.IsArray() {
 		var err error
-		if result.IncludeCollection == nil && (len(p.currentSettings.FieldPaths) > 0 || len(p.currentSettings.TagPaths) > 0) {
+		if result.IncludeCollection == nil && (len(p.objectConfig.FieldPaths) > 0 || len(p.objectConfig.TagPaths) > 0) {
 			result.IncludeCollection = p.existsInpathResults(result.Index, result.Raw)
 		}
 		result.ForEach(func(_, val gjson.Result) bool {
-			m := metric.New(
-				p.measurementName,
-				map[string]string{},
-				map[string]interface{}{},
-				p.Timestamp,
-			)
+			m := metric.New(p.measurementName, map[string]string{}, map[string]interface{}{}, p.timestamp)
 			if val.IsObject() {
-				if p.iterateObjects {
-					n := result
-					n.ParentIndex += val.Index
-					n.Metric = m
-					n.Result = val
-					if n.IncludeCollection == nil && (len(p.currentSettings.FieldPaths) > 0 || len(p.currentSettings.TagPaths) > 0) {
-						n.IncludeCollection = p.existsInpathResults(n.Index, n.Raw)
-					}
-					r, err := p.combineObject(n)
-					if err != nil {
-						return false
-					}
-
-					results = append(results, r...)
-				} else {
-					p.Log.Debugf("Found object in query ignoring it please use 'object' to gather metrics from objects")
+				n := result
+				n.ParentIndex += val.Index
+				n.Metric = m
+				n.Result = val
+				r, err := p.combineObject(n)
+				if err != nil {
+					return false
 				}
+
+				results = append(results, r...)
 				if len(results) != 0 {
 					for _, newResult := range results {
 						mergeMetric(result.Metric, newResult)
@@ -310,7 +308,7 @@ func (p *Parser) expandArray(result MetricNode) ([]telegraf.Metric, error) {
 			n.ParentIndex += val.Index
 			n.Metric = m
 			n.Result = val
-			if n.IncludeCollection == nil && (len(p.currentSettings.FieldPaths) > 0 || len(p.currentSettings.TagPaths) > 0) {
+			if n.IncludeCollection == nil && (len(p.objectConfig.FieldPaths) > 0 || len(p.objectConfig.TagPaths) > 0) {
 				n.IncludeCollection = p.existsInpathResults(n.Index, n.Raw)
 			}
 			r, err := p.expandArray(n)
@@ -324,12 +322,12 @@ func (p *Parser) expandArray(result MetricNode) ([]telegraf.Metric, error) {
 			return nil, err
 		}
 	} else {
-		if result.SetName == p.currentSettings.TimestampKey {
-			if p.currentSettings.TimestampFormat == "" {
+		if result.SetName == p.objectConfig.TimestampKey {
+			if p.objectConfig.TimestampFormat == "" {
 				err := fmt.Errorf("use of 'timestamp_query' requires 'timestamp_format'")
 				return nil, err
 			}
-			timestamp, err := internal.ParseTimestamp(p.currentSettings.TimestampFormat, result.Value(), p.currentSettings.TimestampTimezone)
+			timestamp, err := internal.ParseTimestamp(p.objectConfig.TimestampFormat, result.Value(), p.objectConfig.TimestampTimezone)
 			if err != nil {
 				return nil, err
 			}
@@ -341,7 +339,7 @@ func (p *Parser) expandArray(result MetricNode) ([]telegraf.Metric, error) {
 				outputName := result.OutputName
 				desiredType := result.DesiredType
 
-				if len(p.currentSettings.FieldPaths) > 0 || len(p.currentSettings.TagPaths) > 0 {
+				if len(p.objectConfig.FieldPaths) > 0 || len(p.objectConfig.TagPaths) > 0 {
 					var pathResult *PathResult
 					// When IncludeCollection isn't nil, that means the current result is included in the collection.
 					if result.IncludeCollection != nil {
@@ -386,7 +384,7 @@ func (p *Parser) expandArray(result MetricNode) ([]telegraf.Metric, error) {
 }
 
 func (p *Parser) existsInpathResults(index int, raw string) *PathResult {
-	for _, f := range p.pathResults {
+	for _, f := range p.subPathResults {
 		if f.result.Index == 0 {
 			for _, i := range f.result.Indexes {
 				if i == index {
@@ -401,23 +399,27 @@ func (p *Parser) existsInpathResults(index int, raw string) *PathResult {
 }
 
 // processObjects will iterate over all 'object' configs and create metrics for each
-func (p *Parser) processObjects(objects []JSONObject) ([]telegraf.Metric, error) {
+func (p *Parser) processObjects(input []byte, objects []JSONObject) ([]telegraf.Metric, error) {
 	p.iterateObjects = true
 	var t []telegraf.Metric
 	for _, c := range objects {
-		p.currentSettings = c
+		p.objectConfig = c
 
 		if c.Path == "" {
 			return nil, fmt.Errorf("GJSON path is required")
 		}
-		result := gjson.GetBytes(p.InputJSON, c.Path)
+
+		result := gjson.GetBytes(input, c.Path)
+		if result.Type == gjson.Null {
+			return nil, fmt.Errorf("GJSON Path returned null")
+		}
 
 		scopedJSON := []byte(result.Raw)
 		for _, f := range c.FieldPaths {
 			var r PathResult
 			r.result = gjson.GetBytes(scopedJSON, f.Path)
 			r.DataSet = f
-			p.pathResults = append(p.pathResults, r)
+			p.subPathResults = append(p.subPathResults, r)
 		}
 
 		for _, f := range c.TagPaths {
@@ -425,11 +427,7 @@ func (p *Parser) processObjects(objects []JSONObject) ([]telegraf.Metric, error)
 			r.result = gjson.GetBytes(scopedJSON, f.Path)
 			r.DataSet = f
 			r.tag = true
-			p.pathResults = append(p.pathResults, r)
-		}
-
-		if result.Type == gjson.Null {
-			return nil, fmt.Errorf("GJSON Path returned null")
+			p.subPathResults = append(p.subPathResults, r)
 		}
 
 		rootObject := MetricNode{
@@ -438,7 +436,7 @@ func (p *Parser) processObjects(objects []JSONObject) ([]telegraf.Metric, error)
 				p.measurementName,
 				map[string]string{},
 				map[string]interface{}{},
-				p.Timestamp,
+				p.timestamp,
 			),
 			Result: result,
 		}
@@ -472,12 +470,12 @@ func (p *Parser) combineObject(result MetricNode) ([]telegraf.Metric, error) {
 			}
 
 			var outputName string
-			if p.currentSettings.DisablePrependKeys {
+			if p.objectConfig.DisablePrependKeys {
 				outputName = strings.ReplaceAll(key.String(), " ", "_")
 			} else {
 				outputName = setName
 			}
-			for k, n := range p.currentSettings.Renames {
+			for k, n := range p.objectConfig.Renames {
 				if k == setName {
 					outputName = n
 					break
@@ -490,7 +488,7 @@ func (p *Parser) combineObject(result MetricNode) ([]telegraf.Metric, error) {
 			arrayNode.SetName = setName
 			arrayNode.Result = val
 
-			for k, t := range p.currentSettings.Fields {
+			for k, t := range p.objectConfig.Fields {
 				if setName == k {
 					arrayNode.DesiredType = t
 					break
@@ -498,7 +496,7 @@ func (p *Parser) combineObject(result MetricNode) ([]telegraf.Metric, error) {
 			}
 
 			tag := false
-			for _, t := range p.currentSettings.Tags {
+			for _, t := range p.objectConfig.Tags {
 				if setName == t {
 					tag = true
 					break
@@ -531,27 +529,25 @@ func (p *Parser) combineObject(result MetricNode) ([]telegraf.Metric, error) {
 }
 
 func (p *Parser) isIncluded(key string, val gjson.Result) bool {
-	if len(p.currentSettings.IncludedKeys) == 0 {
+	if len(p.objectConfig.IncludedKeys) == 0 {
 		return true
 	}
 	// automatically adds tags to included_keys so it does NOT have to be repeated in the config
-	allKeys := append(p.currentSettings.IncludedKeys, p.currentSettings.Tags...)
+	allKeys := append(p.objectConfig.IncludedKeys, p.objectConfig.Tags...)
 	for _, i := range allKeys {
 		if i == key {
 			return true
 		}
-		if val.IsArray() || val.IsObject() {
-			// Check if the included key is a sub element
-			if strings.HasPrefix(i, key) {
-				return true
-			}
+		// Check if the included key is a sub element
+		if (val.IsArray() || val.IsObject()) && strings.HasPrefix(i, key) {
+			return true
 		}
 	}
 	return false
 }
 
 func (p *Parser) isExcluded(key string) bool {
-	for _, i := range p.currentSettings.ExcludedKeys {
+	for _, i := range p.objectConfig.ExcludedKeys {
 		if i == key {
 			return true
 		}
@@ -559,45 +555,35 @@ func (p *Parser) isExcluded(key string) bool {
 	return false
 }
 
-func (p *Parser) ParseLine(line string) (telegraf.Metric, error) {
-	return nil, fmt.Errorf("ParseLine is designed for parsing influx line protocol, therefore not implemented for parsing JSON")
-}
-
-func (p *Parser) SetDefaultTags(tags map[string]string) {
-	p.DefaultTags = tags
-}
-
 // convertType will convert the value parsed from the input JSON to the specified type in the config
 func (p *Parser) convertType(input gjson.Result, desiredType string, name string) (interface{}, error) {
 	switch inputType := input.Value().(type) {
 	case string:
-		if desiredType != "string" {
-			switch desiredType {
-			case "uint":
-				r, err := strconv.ParseUint(inputType, 10, 64)
-				if err != nil {
-					return nil, fmt.Errorf("Unable to convert field '%s' to type uint: %v", name, err)
-				}
-				return r, nil
-			case "int":
-				r, err := strconv.ParseInt(inputType, 10, 64)
-				if err != nil {
-					return nil, fmt.Errorf("Unable to convert field '%s' to type int: %v", name, err)
-				}
-				return r, nil
-			case "float":
-				r, err := strconv.ParseFloat(inputType, 64)
-				if err != nil {
-					return nil, fmt.Errorf("Unable to convert field '%s' to type float: %v", name, err)
-				}
-				return r, nil
-			case "bool":
-				r, err := strconv.ParseBool(inputType)
-				if err != nil {
-					return nil, fmt.Errorf("Unable to convert field '%s' to type bool: %v", name, err)
-				}
-				return r, nil
+		switch desiredType {
+		case "uint":
+			r, err := strconv.ParseUint(inputType, 10, 64)
+			if err != nil {
+				return nil, fmt.Errorf("unable to convert field '%s' to type uint: %v", name, err)
 			}
+			return r, nil
+		case "int":
+			r, err := strconv.ParseInt(inputType, 10, 64)
+			if err != nil {
+				return nil, fmt.Errorf("unable to convert field '%s' to type int: %v", name, err)
+			}
+			return r, nil
+		case "float":
+			r, err := strconv.ParseFloat(inputType, 64)
+			if err != nil {
+				return nil, fmt.Errorf("unable to convert field '%s' to type float: %v", name, err)
+			}
+			return r, nil
+		case "bool":
+			r, err := strconv.ParseBool(inputType)
+			if err != nil {
+				return nil, fmt.Errorf("unable to convert field '%s' to type bool: %v", name, err)
+			}
+			return r, nil
 		}
 	case bool:
 		switch desiredType {
@@ -617,22 +603,20 @@ func (p *Parser) convertType(input gjson.Result, desiredType string, name string
 			return uint64(0), nil
 		}
 	case float64:
-		if desiredType != "float" {
-			switch desiredType {
-			case "string":
-				return fmt.Sprint(inputType), nil
-			case "int":
-				return input.Int(), nil
-			case "uint":
-				return input.Uint(), nil
-			case "bool":
-				if inputType == 0 {
-					return false, nil
-				} else if inputType == 1 {
-					return true, nil
-				} else {
-					return nil, fmt.Errorf("Unable to convert field '%s' to type bool", name)
-				}
+		switch desiredType {
+		case "string":
+			return fmt.Sprint(inputType), nil
+		case "int":
+			return input.Int(), nil
+		case "uint":
+			return input.Uint(), nil
+		case "bool":
+			if inputType == 0 {
+				return false, nil
+			} else if inputType == 1 {
+				return true, nil
+			} else {
+				return nil, fmt.Errorf("unable to convert field '%s' to type bool", name)
 			}
 		}
 	default:
