@@ -1,11 +1,8 @@
 package snmp
 
 import (
-	"fmt"
 	"net"
-	"os"
 	"path/filepath"
-	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -16,8 +13,6 @@ import (
 	"github.com/influxdata/telegraf/plugins/inputs"
 	"github.com/influxdata/telegraf/testutil"
 	"github.com/influxdata/toml"
-	"github.com/sleepinggenius2/gosmi"
-	"github.com/sleepinggenius2/gosmi/types"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -1162,85 +1157,4 @@ func TestTableJoinNoIndexAsTag_walk(t *testing.T) {
 	assert.Contains(t, tb.Rows, rtr1)
 	assert.Contains(t, tb.Rows, rtr2)
 	assert.Contains(t, tb.Rows, rtr3)
-}
-
-func TestGoSmi(t *testing.T) {
-	gosmi.Init()
-	Path := []string{"./testdata"}
-	var folders []string
-	for _, mibPath := range Path {
-		gosmi.AppendPath(mibPath)
-		folders = append(folders, mibPath)
-		err := filepath.Walk(mibPath, func(path string, info os.FileInfo, err error) error {
-			if info.Mode()&os.ModeSymlink != 0 {
-				s, _ := os.Readlink(path)
-				folders = append(folders, s)
-			}
-			return nil
-		})
-		require.NoError(t, err)
-		for _, folder := range folders {
-			err := filepath.Walk(folder, func(path string, info os.FileInfo, err error) error {
-				if info.IsDir() {
-					gosmi.AppendPath(path)
-				} else if info.Mode()&os.ModeSymlink == 0 {
-					gosmi.LoadModule(info.Name())
-					//println(load)
-				}
-				return nil
-			})
-			require.NoError(t, err)
-		}
-		folders = []string{}
-	}
-	oid := "RFC1213-MIB::atTable"
-
-	s := strings.Split(oid, "::")
-	var end string
-	// node becomes sysUpTime.0
-	node := s[1]
-	if strings.ContainsAny(node, ".") {
-		s = strings.Split(node, ".")
-		// node becomes sysUpTime
-		node = s[0]
-		end = "." + s[1]
-	}
-
-	out, err := gosmi.GetNode(node)
-	require.NoError(t, err)
-
-	oidNum := "." + out.RenderNumeric() + end
-
-	println(oidNum)
-
-	oidText := out.RenderQualified()
-	i := strings.Index(oidText, "::")
-
-	mibName := oidText[:i]
-	oidText = oidText[i+2:]
-	println("mibname: " + mibName)
-	submask := oidNum + ".1"
-	node1, err := gosmi.GetNodeByOID(types.OidMustFromString(submask))
-
-	require.NoError(t, err)
-
-	index := node1.GetIndex()
-	tagOids := map[string]struct{}{}
-	var mibPrefix string
-
-	for i := range index {
-		tagOids[mibPrefix+index[i].Name] = struct{}{}
-	}
-
-	// grabs all columns from the table
-	// mimmicks grabbing everything returned from snmptable -Ch -Cl -c public 127.0.0.1 oidFullName
-	col := node1.GetRow().AsTable().ColumnOrder
-	fmt.Printf("cols: \t %v \n", col)
-	for i := range col {
-		fmt.Printf("cols: \t %v \n", col[i])
-		_, isTag := tagOids[mibPrefix+col[i]]
-		println(isTag)
-	}
-
-	require.Error(t, err)
 }
